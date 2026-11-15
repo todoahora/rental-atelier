@@ -162,6 +162,16 @@ export function installCloud(bridge) {
           remember(context);
         } else if (context.writing) {
           return;
+        } else if (bridge.merge) {
+          const merged = bridge.merge(entry.payload, context.pending.payload);
+          context.pending = { base: entry.revision, payload: merged };
+          context.revision = entry.revision;
+          remember(context);
+          if (bridge.canApply()) { bridge.apply(merged); context.appliedPayload = merged; }
+          setMessage('Combined changes from both devices. Syncing…');
+          paint();
+          void flush(context);
+          return;
         } else {
           context.conflict = true;
           setMessage('Someone changed the workspace. Download your draft before loading the shared version.');
@@ -231,6 +241,12 @@ export function installCloud(bridge) {
       if (context.pending) {
         bridge.apply(context.pending.payload);
         context.appliedPayload = context.pending.payload;
+        if (bridge.merge && context.pending.base !== data.revision) {
+          context.pending = { base: data.revision, payload: bridge.merge(data.payload, context.pending.payload) };
+          bridge.apply(context.pending.payload);
+          context.appliedPayload = context.pending.payload;
+          remember(context);
+        }
         context.conflict = context.pending.base !== data.revision;
         setMessage(context.conflict
           ? 'A local draft differs from the shared version. Download it before loading the shared version.'
@@ -277,17 +293,35 @@ export function installCloud(bridge) {
           const snapshot = await tx.get(context.ref);
           const entry = snapshot.data();
           if (!entry) throw problem('This workspace is unavailable.');
+          if (bridge.merge) {
+            const merged = bridge.merge(entry.payload, draft.payload);
+            checkSize(merged);
+            tx.update(context.ref, { payload: merged, revision: entry.revision + 1 });
+            draft.mergedPayload = merged === draft.payload ? undefined : merged;
+            return entry.revision + 1;
+          }
           if (entry.revision !== draft.base) {
-            context.conflict = true;
-            throw problem('Someone changed the workspace. Download your draft before loading the shared version.');
+            if (!bridge.merge) {
+              context.conflict = true;
+              throw problem('Someone changed the workspace. Download your draft before loading the shared version.');
+            }
+            const merged = bridge.merge(entry.payload, draft.payload);
+            checkSize(merged);
+            tx.update(context.ref, { payload: merged, revision: entry.revision + 1 });
+            draft.mergedPayload = merged;
+            return entry.revision + 1;
           }
           tx.update(context.ref, { payload: draft.payload, revision: draft.base + 1 });
           return draft.base + 1;
         });
         context.revision = revision;
-        context.appliedPayload = draft.payload;
+        context.appliedPayload = draft.mergedPayload ?? draft.payload;
         if (context.pending === draft) context.pending = null;
-        else if (context.pending) context.pending.base = revision;
+        else if (context.pending) {
+          context.pending.base = revision;
+          if (draft.mergedPayload) context.pending.payload = bridge.merge(draft.mergedPayload, context.pending.payload);
+        }
+        if (draft.mergedPayload && bridge.canApply()) bridge.apply(context.pending?.payload ?? draft.mergedPayload);
         remember(context);
       }
       if (active === context) {
